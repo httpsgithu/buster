@@ -1,8 +1,12 @@
-import browser from 'webextension-polyfill';
-
 import storage from 'storage/storage';
 import {meanSleep, pingClientApp} from 'utils/app';
-import {getText, waitForElement, getRandomFloat, sleep} from 'utils/common';
+import {
+  getText,
+  findNode,
+  getRandomFloat,
+  sleep,
+  getBrowser
+} from 'utils/common';
 import {targetEnv, clientAppVersion} from 'utils/config';
 
 let solverWorking = false;
@@ -35,7 +39,7 @@ function syncUI() {
       const button = document.createElement('button');
       button.classList.add('rc-button');
       button.setAttribute('tabindex', '0');
-      button.setAttribute('title', getText('buttonText_reset'));
+      button.setAttribute('title', getText('buttonLabel_reset'));
       button.id = 'reset-button';
 
       button.addEventListener('click', resetCaptcha);
@@ -51,19 +55,26 @@ function syncUI() {
     helpButton.remove();
 
     const helpButtonHolder = document.querySelector('.help-button-holder');
-    const shadow = helpButtonHolder.attachShadow({mode: 'closed'});
+    helpButtonHolder.tabIndex = document.querySelector('audio#audio-source')
+      ? 0
+      : 2;
+
+    const shadow = helpButtonHolder.attachShadow({
+      mode: 'closed',
+      delegatesFocus: true
+    });
 
     const link = document.createElement('link');
     link.setAttribute('rel', 'stylesheet');
     link.setAttribute(
       'href',
-      browser.extension.getURL('/src/solve/solver-button.css')
+      browser.runtime.getURL('/src/solve/solver-button.css')
     );
     shadow.appendChild(link);
 
     solverButton = document.createElement('button');
     solverButton.setAttribute('tabindex', '0');
-    solverButton.setAttribute('title', getText('buttonText_solve'));
+    solverButton.setAttribute('title', getText('buttonLabel_solve'));
     solverButton.id = 'solver-button';
     if (solverWorking) {
       solverButton.classList.add('working');
@@ -79,7 +90,7 @@ function isBlocked({timeout = 0} = {}) {
   const selector = '.rc-doscaptcha-body';
   if (timeout) {
     return new Promise(resolve => {
-      waitForElement(selector, {timeout}).then(result =>
+      findNode(selector, {timeout, throwError: false}).then(result =>
         resolve(Boolean(result))
       );
     });
@@ -133,8 +144,8 @@ async function tapEnter(node, {navigateForward = true} = {}) {
   await messageClientApp({command: 'tapKey', data: 'enter'});
 }
 
-async function clickElement(node, browserBorder) {
-  const targetPos = await getClickPos(node, browserBorder);
+async function clickElement(node, browserBorder, osScale) {
+  const targetPos = await getClickPos(node, browserBorder, osScale);
   await messageClientApp({command: 'moveMouse', ...targetPos});
   await meanSleep(100);
   await messageClientApp({command: 'clickMouse'});
@@ -154,31 +165,31 @@ async function messageClientApp(message) {
 }
 
 async function getOsScale() {
-  // The background script devicePixelRatio is not affected by the default
-  // zoom level in Firefox, while the content script devicePixelRatio
-  // is affected, unless only text is zoomed.
-  if (targetEnv === 'firefox') {
-    return browser.runtime.sendMessage({id: 'getBackgroundScriptScale'});
-  }
-
-  const zoom = await browser.runtime.sendMessage({id: 'getTabZoom'});
-
-  return window.devicePixelRatio / zoom;
+  return browser.runtime.sendMessage({id: 'getOsScale'});
 }
 
-async function getBrowserBorder(clickEvent) {
+async function getBrowserBorder(clickEvent, osScale) {
   const framePos = await getFrameClientPos();
   const scale = window.devicePixelRatio;
-  const osScale = await getOsScale();
+
+  let evScreenPropScale = osScale;
+  if (
+    targetEnv === 'firefox' &&
+    parseInt((await getBrowser()).version.split('.')[0], 10) >= 99
+  ) {
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=1753836
+
+    evScreenPropScale = scale;
+  }
 
   return {
     left:
-      clickEvent.screenX * osScale -
+      clickEvent.screenX * evScreenPropScale -
       clickEvent.clientX * scale -
       framePos.x -
       window.screenX * scale,
     top:
-      clickEvent.screenY * osScale -
+      clickEvent.screenY * evScreenPropScale -
       clickEvent.clientY * scale -
       framePos.y -
       window.screenY * scale
@@ -202,7 +213,7 @@ async function getFrameClientPos() {
   return {x: 0, y: 0};
 }
 
-async function getElementScreenRect(node, browserBorder) {
+async function getElementScreenRect(node, browserBorder, osScale) {
   let {left: x, top: y, width, height} = node.getBoundingClientRect();
 
   const data = await getFrameClientPos();
@@ -218,7 +229,6 @@ async function getElementScreenRect(node, browserBorder) {
 
   const {os} = await browser.runtime.sendMessage({id: 'getPlatform'});
   if (['windows', 'macos'].includes(os)) {
-    const osScale = await getOsScale();
     x /= osScale;
     y /= osScale;
     width /= osScale;
@@ -228,8 +238,12 @@ async function getElementScreenRect(node, browserBorder) {
   return {x, y, width, height};
 }
 
-async function getClickPos(node, browserBorder) {
-  let {x, y, width, height} = await getElementScreenRect(node, browserBorder);
+async function getClickPos(node, browserBorder, osScale) {
+  let {x, y, width, height} = await getElementScreenRect(
+    node,
+    browserBorder,
+    osScale
+  );
 
   return {
     x: Math.round(x + width * getRandomFloat(0.4, 0.6)),
@@ -242,16 +256,15 @@ async function solve(simulateUserInput, clickEvent) {
     return;
   }
 
-  const {navigateWithKeyboard} = await storage.get(
-    'navigateWithKeyboard',
-    'sync'
-  );
+  const {navigateWithKeyboard} = await storage.get('navigateWithKeyboard');
 
   let browserBorder;
+  let osScale;
   let useMouse = true;
   if (simulateUserInput) {
     if (!navigateWithKeyboard && (clickEvent.clientX || clickEvent.clientY)) {
-      browserBorder = await getBrowserBorder(clickEvent);
+      osScale = await getOsScale();
+      browserBorder = await getBrowserBorder(clickEvent, osScale);
     } else {
       useMouse = false;
     }
@@ -263,9 +276,10 @@ async function solve(simulateUserInput, clickEvent) {
     const audioButton = document.querySelector('#recaptcha-audio-button');
     if (simulateUserInput) {
       if (useMouse) {
-        await clickElement(audioButton, browserBorder);
+        await clickElement(audioButton, browserBorder, osScale);
       } else {
-        await tapEnter(audioButton, {navigateForward: false});
+        audioButton.focus();
+        await tapEnter(audioButton);
       }
     } else {
       dispatchEnter(audioButton);
@@ -273,9 +287,11 @@ async function solve(simulateUserInput, clickEvent) {
 
     const result = await Promise.race([
       new Promise(resolve => {
-        waitForElement(audioElSelector, {timeout: 10000}).then(el => {
-          meanSleep(500).then(() => resolve({audioEl: el}));
-        });
+        findNode(audioElSelector, {timeout: 10000, throwError: false}).then(
+          el => {
+            meanSleep(500).then(() => resolve({audioEl: el}));
+          }
+        );
       }),
       new Promise(resolve => {
         isBlocked({timeout: 10000}).then(blocked => resolve({blocked}));
@@ -325,7 +341,7 @@ async function solve(simulateUserInput, clickEvent) {
       '.rc-audiochallenge-play-button > button'
     );
     if (useMouse) {
-      await clickElement(playButton, browserBorder);
+      await clickElement(playButton, browserBorder, osScale);
     } else {
       await tapEnter(playButton);
     }
@@ -347,7 +363,7 @@ async function solve(simulateUserInput, clickEvent) {
   const input = document.querySelector('#audio-response');
   if (simulateUserInput) {
     if (useMouse) {
-      await clickElement(input, browserBorder);
+      await clickElement(input, browserBorder, osScale);
     } else {
       await navigateToElement(input);
     }
@@ -361,7 +377,7 @@ async function solve(simulateUserInput, clickEvent) {
   const submitButton = document.querySelector('#recaptcha-verify-button');
   if (simulateUserInput) {
     if (useMouse) {
-      await clickElement(submitButton, browserBorder);
+      await clickElement(submitButton, browserBorder, osScale);
     } else {
       await tapEnter(submitButton);
     }
@@ -396,10 +412,10 @@ function solveChallenge(ev) {
 }
 
 async function runSolver(ev) {
-  const {simulateUserInput, autoUpdateClientApp} = await storage.get(
-    ['simulateUserInput', 'autoUpdateClientApp'],
-    'sync'
-  );
+  const {simulateUserInput, autoUpdateClientApp} = await storage.get([
+    'simulateUserInput',
+    'autoUpdateClientApp'
+  ]);
 
   if (simulateUserInput) {
     try {
@@ -478,7 +494,7 @@ async function runSolver(ev) {
 
 function init() {
   const observer = new MutationObserver(syncUI);
-  observer.observe(document.body, {
+  observer.observe(document, {
     childList: true,
     subtree: true
   });
